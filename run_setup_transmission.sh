@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Wrapper around run_setup.sh that:
 #   - connects with WireGuard, port forwarding on, no dedicated IP
-#   - picks the lowest latency port-forwarding region outside the UK
+#   - picks the lowest latency port-forwarding region outside the UK,
+#     skipping geolocated regions (shown as "(geo)" in the region name)
 #   - sets transmission-daemon's peer port to the forwarded port
 #
 # PIA_USER/PIA_PASS are prompted for by run_setup.sh unless set in the environment.
@@ -45,11 +46,13 @@ tr_rpc() {
   curl -s -m 10 "${auth[@]}" -H "X-Transmission-Session-Id: $sessionId" -d "$1" "$url"
 }
 
-# Region ids in the excluded countries
+# Region ids in the excluded countries, plus all geolocated regions (their
+# servers are not physically in the country the region is named after)
 serverlist_url='https://serverlist.piaservers.net/vpninfo/servers/v6'
 excludedRegions="$(curl -s "$serverlist_url" | head -1 |
   jq -r --arg countries "$EXCLUDE_COUNTRIES" \
-  '($countries | split(" ")) as $c | .regions[] | select(.country as $x | $c | index($x)) | .id')"
+  '($countries | split(" ")) as $c | .regions[] |
+  select(.geo == true or (.country as $x | $c | index($x))) | .id')"
 if [[ -z $excludedRegions ]]; then
   echo "Could not fetch the PIA server list."
   exit 1
@@ -57,7 +60,7 @@ fi
 
 # Build the latency ordered list of port forwarding regions.
 # PIA_USER/PIA_PASS are unset so get_region.sh stops before fetching a token.
-echo "Testing port forwarding regions (excluding $EXCLUDE_COUNTRIES)..."
+echo "Testing port forwarding regions (excluding $EXCLUDE_COUNTRIES and geolocated regions)..."
 env -u PIA_USER -u PIA_PASS -u PIA_TOKEN \
   PIA_PF=true PREFERRED_REGION=none VPN_PROTOCOL=no ./get_region.sh >/dev/null || exit 1
 
@@ -71,7 +74,7 @@ while read -r _ regionId _; do
 done < /opt/piavpn-manual/latencyList
 
 if [[ -z $PREFERRED_REGION ]]; then
-  echo "No region outside $EXCLUDE_COUNTRIES responded within ${MAX_LATENCY}s."
+  echo "No non-geolocated region outside $EXCLUDE_COUNTRIES responded within ${MAX_LATENCY}s."
   echo "Try a higher timeout, for example: sudo MAX_LATENCY=1 $0"
   exit 1
 fi
