@@ -2,12 +2,16 @@
 # Wrapper around run_setup.sh that:
 #   - connects with WireGuard, port forwarding on, no dedicated IP
 #   - picks the lowest latency port-forwarding region outside the UK,
-#     skipping geolocated regions (shown as "(geo)" in the region name)
+#     skipping geolocated regions (shown as "(geo)" in the region name),
+#     unless a region is given in PIA_REGION
 #   - sets transmission-daemon's peer port to the forwarded port
 #
 # PIA_USER/PIA_PASS are prompted for by run_setup.sh unless set in the environment.
 #
 # Optional environment variables:
+#   PIA_REGION        region id to connect to, skipping latency testing; must
+#                     support port forwarding. EXCLUDE_COUNTRIES and the geo
+#                     exclusion don't apply to it.
 #   MAX_LATENCY       max latency in seconds when testing regions (default 0.2)
 #   EXCLUDE_COUNTRIES space separated country codes to skip (default "GB")
 #   PIA_DNS           force PIA DNS (default true)
@@ -46,40 +50,62 @@ tr_rpc() {
   curl -s -m 10 "${auth[@]}" -H "X-Transmission-Session-Id: $sessionId" -d "$1" "$url"
 }
 
-# Region ids in the excluded countries, plus all geolocated regions (their
-# servers are not physically in the country the region is named after)
 serverlist_url='https://serverlist.piaservers.net/vpninfo/servers/v6'
-excludedRegions="$(curl -s "$serverlist_url" | head -1 |
-  jq -r --arg countries "$EXCLUDE_COUNTRIES" \
-  '($countries | split(" ")) as $c | .regions[] |
-  select(.geo == true or (.country as $x | $c | index($x))) | .id')"
-if [[ -z $excludedRegions ]]; then
+serverList="$(curl -s "$serverlist_url" | head -1)"
+if ! jq -e '.regions | length > 0' <<< "$serverList" >/dev/null 2>&1; then
   echo "Could not fetch the PIA server list."
   exit 1
 fi
 
-# Build the latency ordered list of port forwarding regions.
-# PIA_USER/PIA_PASS are unset so get_region.sh stops before fetching a token.
-echo "Testing port forwarding regions (excluding $EXCLUDE_COUNTRIES and geolocated regions)..."
-env -u PIA_USER -u PIA_PASS -u PIA_TOKEN \
-  PIA_PF=true PREFERRED_REGION=none VPN_PROTOCOL=no ./get_region.sh >/dev/null || exit 1
-
-# latencyList is sorted by latency: "<time> <region id>\t<ip>\t<name>"
-PREFERRED_REGION=""
-while read -r _ regionId _; do
-  if ! grep -qxF "$regionId" <<< "$excludedRegions"; then
-    PREFERRED_REGION=$regionId
-    break
+# Use the region from PIA_REGION as is, without latency testing or exclusions.
+# It must support port forwarding, since that's what the wrapper is for.
+if [[ -n $PIA_REGION ]]; then
+  regionName="$(jq -r --arg id "$PIA_REGION" \
+    '.regions[] | select(.id == $id and .port_forward) |
+    .name + (if .geo then " (geo)" else "" end)' <<< "$serverList")"
+  if [[ -z $regionName ]]; then
+    echo "PIA_REGION=$PIA_REGION is not a port forwarding region id."
+    echo "Valid ids (non-geolocated):"
+    jq -r '.regions[] | select(.port_forward and (.geo | not)) | "  \(.id)\t\(.name)"' \
+      <<< "$serverList" | sort
+    exit 1
   fi
-done < /opt/piavpn-manual/latencyList
-
-if [[ -z $PREFERRED_REGION ]]; then
-  echo "No non-geolocated region outside $EXCLUDE_COUNTRIES responded within ${MAX_LATENCY}s."
-  echo "Try a higher timeout, for example: sudo MAX_LATENCY=1 $0"
-  exit 1
+  PREFERRED_REGION=$PIA_REGION
+  echo "Selected region from PIA_REGION: $PREFERRED_REGION ($regionName)"
+  echo
 fi
-echo "Selected region: $(grep -P "^\S+ \Q$PREFERRED_REGION\E\t" /opt/piavpn-manual/latencyList)"
-echo
+
+if [[ -z $PIA_REGION ]]; then
+  # Region ids in the excluded countries, plus all geolocated regions (their
+  # servers are not physically in the country the region is named after)
+  excludedRegions="$(jq -r --arg countries "$EXCLUDE_COUNTRIES" \
+    '($countries | split(" ")) as $c | .regions[] |
+    select(.geo == true or (.country as $x | $c | index($x))) | .id' <<< "$serverList")"
+
+  # Build the latency ordered list of port forwarding regions.
+  # PIA_USER/PIA_PASS are unset so get_region.sh stops before fetching a token.
+  echo "Testing port forwarding regions (excluding $EXCLUDE_COUNTRIES and geolocated regions)..."
+  env -u PIA_USER -u PIA_PASS -u PIA_TOKEN \
+    PIA_PF=true PREFERRED_REGION=none VPN_PROTOCOL=no ./get_region.sh >/dev/null || exit 1
+
+  # latencyList is sorted by latency: "<time> <region id>\t<ip>\t<name>"
+  PREFERRED_REGION=""
+  while read -r _ regionId _; do
+    if ! grep -qxF "$regionId" <<< "$excludedRegions"; then
+      PREFERRED_REGION=$regionId
+      break
+    fi
+  done < /opt/piavpn-manual/latencyList
+
+  if [[ -z $PREFERRED_REGION ]]; then
+    echo "No non-geolocated region outside $EXCLUDE_COUNTRIES responded within ${MAX_LATENCY}s."
+    echo "Try a higher timeout, for example: sudo MAX_LATENCY=1 $0"
+    echo "Or pick a region yourself, for example: sudo PIA_REGION=nl_amsterdam $0"
+    exit 1
+  fi
+  echo "Selected region: $(grep -P "^\S+ \Q$PREFERRED_REGION\E\t" /opt/piavpn-manual/latencyList)"
+  echo
+fi
 
 # Hard coded connection settings. AUTOCONNECT must stay unset, or run_setup.sh
 # ignores PREFERRED_REGION and picks the lowest latency region itself.
